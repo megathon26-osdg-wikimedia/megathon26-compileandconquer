@@ -1,0 +1,53 @@
+# Seed categories for fetch_commons.py, grouped by the four types the
+# evaluation stratifies on. Lines starting with "#" are section headers.
+
+# object
+Category:Dogs
+Category:Sleeping cats
+Category:Bicycles
+Category:Trams in Amsterdam
+Category:Lighthouses in England
+Category:Mosques in Algeria
+Category:Hindu temples
+Category:Bridges in Paris
+Category:Butterflies
+Category:Mushrooms
+Category:Rickshaws
+Category:Oil lamps
+
+# scene
+Category:Sunsets
+Category:Beaches
+Category:Waterfalls
+Category:Deserts
+Category:Paddy fields
+Category:Night skylines
+Category:Snowy landscapes
+Category:Markets in India
+Category:Rainforests
+Category:Libraries
+Category:Street food
+
+# event
+Category:Holi
+Category:Rangoli
+Category:Ganesh Chaturthi
+Category:Onam
+Category:Eid al-Fitr
+Category:Chinese New Year
+Category:Marathons
+Category:Weddings
+Category:Protests
+Category:Fireworks
+Category:Association football matches
+Category:Carnivals
+
+# abstract
+Category:Poverty
+Category:Friendship
+Category:Loneliness
+Category:Childhood
+Category:Abandoned buildings
+Category:Graffiti
+Category:Traffic congestion
+Category:Pollution
