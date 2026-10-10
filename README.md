@@ -10,8 +10,7 @@
 ## Setup
 
 ```bash
-git clone <this repository>
-cd <repository folder>
+git clone https://github.com/IIIT-ECell/megathon26-compileandconquer.git
 python3 -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
