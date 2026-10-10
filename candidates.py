@@ -77,18 +77,25 @@ def main():
     cache_path = os.path.join(args.data, "search_cache.json")
     cache = json.load(open(cache_path, encoding="utf-8")) if os.path.exists(cache_path) else {}
 
-    candidates = {}
+    candidates, failed = {}, 0
     todo = [recs[i] for i in [*val, *test]]
     for n, rec in enumerate(todo, 1):
         words = query_words(rec)
         key = " OR ".join(words)
         if words and key not in cache:
-            cache[key] = search_categories(words, args.limit)
+            try:
+                cache[key] = search_categories(words, args.limit)
+            except RuntimeError as e:  # still failing after retries: skip, a re-run fills it in
+                print(f"  search failed for {rec['title']}: {e}")
+                failed += 1
+                continue
             if len(cache) % 50 == 0:
                 json.dump(cache, open(cache_path, "w", encoding="utf-8"), ensure_ascii=False)
         candidates[rec["title"]] = cache.get(key, [])
         print(f"  {n}/{len(todo)}", end="\r", flush=True)
     print()
+    if failed:
+        print(f"{failed} searches failed; run again to fill them in (results are cached)")
     json.dump(cache, open(cache_path, "w", encoding="utf-8"), ensure_ascii=False)
     json.dump(candidates, open(os.path.join(args.data, "candidates.json"), "w", encoding="utf-8"),
               ensure_ascii=False)

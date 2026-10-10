@@ -21,6 +21,7 @@ import itertools
 import json
 import os
 from collections import defaultdict
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -159,6 +160,23 @@ def macro_map(S, true_sets, cols, vocab_index):
     return float(np.mean(aps))
 
 
+def fit_logreg(F, y, l2=1.0, iters=50):
+    """L2-regularized logistic regression by Newton's method. Returns (mean, std, weights)."""
+    mu, sd = F.mean(0), F.std(0) + 1e-9
+    Z = np.hstack([(F - mu) / sd, np.ones((len(F), 1))])
+    w = np.zeros(Z.shape[1])
+    reg = np.r_[np.full(len(w) - 1, l2), 0.0]  # no penalty on the bias
+    for _ in range(iters):
+        p = 1 / (1 + np.exp(-Z @ w))
+        g = Z.T @ (p - y) + reg * w
+        H = (Z * (p * (1 - p))[:, None]).T @ Z + np.diag(reg)
+        step = np.linalg.solve(H, g)
+        w -= step
+        if np.abs(step).max() < 1e-6:
+            break
+    return mu, sd, w
+
+
 def simplex(n, steps):
     """All weight vectors of length n with entries in multiples of 1/steps summing to 1."""
     for c in itertools.product(range(steps + 1), repeat=n - 1):
@@ -166,7 +184,7 @@ def simplex(n, steps):
             yield np.array([*c, steps - sum(c)]) / steps
 
 
-def main():
+def parse_args(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", default="data")
     ap.add_argument("--k", type=int, default=20, help="neighbours for k-NN voting")
@@ -176,16 +194,27 @@ def main():
     ap.add_argument("--no-candidates", action="store_true", help="ignore candidates.py output")
     ap.add_argument("--min-cand-files", type=int, default=2,
                     help="drop search candidates with fewer files (likely created for this upload)")
+    ap.add_argument("--stack-top", type=int, default=30,
+                    help="candidates per scorer that the stacked fusion re-ranks")
     ap.add_argument("--objective", default="P@1+R@10", choices=["R@5", "P@1", "R@10", "P@1+R@10"],
                     help="what the fusion weights maximize on validation")
     ap.add_argument("--examples", type=int, default=4, help="test images to print suggestions for")
-    args = ap.parse_args()
+    return ap.parse_args(argv)
 
+
+def prepare(args, verbose=True):
+    """Load data, split, build the vocabulary and pick fusion weights on validation.
+
+    Returns a namespace with everything needed to score any set of images,
+    including all_scores(idx, Xq=None): Xq replaces the query images' embeddings
+    (e.g. degraded copies), while the training index stays clean.
+    """
+    say = print if verbose else (lambda *a, **k: None)
     recs, X, M, cats, T = load(args.data)
     train, val, test, n_dup = temporal_split(recs, X, 0.1, 0.2, args.dup_thresh)
-    print(f"{len(recs)} images: train {len(train)}, val {len(val)}, test {len(test)} "
+    say(f"{len(recs)} images: train {len(train)}, val {len(val)}, test {len(test)} "
           f"({n_dup} near-duplicates of train removed from test)")
-    print(f"test uploads from {recs[test[0]]['timestamp'][:10]} onward")
+    say(f"test uploads from {recs[test[0]]['timestamp'][:10]} onward")
 
     cands, cand_emb = (None, {}) if args.no_candidates else load_candidates(args.data, args.min_cand_files)
     scorers = ["img_knn", "img_txt", "meta_knn", "meta_txt"] + (["search"] if cands else [])
@@ -195,10 +224,13 @@ def main():
     cat_index = {c: j for j, c in enumerate(cats)}
     Tvocab = T[[cat_index[c] for c in vocab]]
     Ytrain = label_matrix(recs, train, vocab_index)
-    print(f"vocabulary: {len(vocab)} categories seen in train"
+    say(f"vocabulary: {len(vocab)} categories seen in train"
           + (f" + each image's own search candidates (>= {args.min_cand_files} files)" if cands else "") + "\n")
 
-    def all_scores(idx):
+    Xtrain, Mtrain = X[train], M[train]
+
+    def all_scores(idx, Xq=None):
+        Xq = X[idx] if Xq is None else Xq
         found = [cands.get(recs[i]["title"], []) if cands else [] for i in idx]
         cols = Columns(vocab, [[c for c in f if c not in vocab_index] for f in found])
         D = T.shape[1]
@@ -208,9 +240,9 @@ def main():
             for p, c in enumerate(e):
                 Textra[r, p], pad[r, p] = cand_emb[c], False
         s = {
-            "img_knn": knn_scores(X[idx], X[train], Ytrain, args.k, args.tau, cols.P),
-            "img_txt": text_scores(X[idx], Tvocab, Textra, pad, args.temp),
-            "meta_knn": knn_scores(M[idx], M[train], Ytrain, args.k, args.tau, cols.P),
+            "img_knn": knn_scores(Xq, Xtrain, Ytrain, args.k, args.tau, cols.P),
+            "img_txt": text_scores(Xq, Tvocab, Textra, pad, args.temp),
+            "meta_knn": knn_scores(M[idx], Mtrain, Ytrain, args.k, args.tau, cols.P),
             "meta_txt": text_scores(M[idx], Tvocab, Textra, pad, args.temp),
         }
         if cands:
@@ -232,16 +264,74 @@ def main():
     val_truth = [set(recs[i]["categories"]) for i in val]
     best_w = max(simplex(len(scorers), 10),
                  key=lambda w: objective(precision_recall_at_k(fuse(val_scores, w), val_truth, val_cols)))
-    print(f"fusion weights picked on validation (maximizing {args.objective}): "
+    say(f"fusion weights picked on validation (maximizing {args.objective}): "
           + ", ".join(f"{n}={w:.1f}" for n, w in zip(scorers, best_w)) + "\n")
 
-    test_scores, cols = all_scores(test)
-    test_truth = [set(recs[i]["categories"]) for i in test]
     image_only = max(simplex(2, 10), key=lambda w: objective(precision_recall_at_k(
         fuse(val_scores, [*w] + [0] * (len(scorers) - 2)), val_truth, val_cols)))
+    image_only_w = [*image_only] + [0] * (len(scorers) - 2)
+
+    # Calibrated stacking: instead of one global weight per scorer, a logistic
+    # regression on validation data predicts "editors used this category" from each
+    # candidate's scores, log-scores and ranks under every scorer, plus how common the
+    # category is in training and whether only search found it. It re-ranks the union
+    # of each scorer's top candidates for an image.
+    freq = Ytrain.sum(0)
+
+    def stack_features(scores, cols):
+        n, width = scores[scorers[0]].shape
+        ranks, cand = {}, [set() for _ in range(n)]
+        for k in scorers:
+            order = np.argsort(-scores[k], axis=1)
+            rk = np.empty_like(order)
+            np.put_along_axis(rk, order, np.broadcast_to(np.arange(width), order.shape), axis=1)
+            ranks[k] = rk
+            for r in range(n):
+                cand[r].update(order[r, :args.stack_top].tolist())
+        out = []
+        for r in range(n):
+            js = np.array([j for j in sorted(cand[r]) if cols.name(r, j) is not None])
+            F = []
+            for k in scorers:
+                sc = scores[k][r, js]
+                F += [sc, np.log(sc + 1e-4), 1 / (1 + ranks[k][r, js])]
+            F += [np.log1p(np.array([freq[j] if j < cols.V else 0 for j in js])), (js >= cols.V).astype(float)]
+            out.append((js, np.stack(F, 1)))
+        return out
+
+    feats = stack_features(val_scores, val_cols)
+    Fv = np.vstack([F for _, F in feats])
+    yv = np.concatenate([[val_cols.name(r, j) in val_truth[r] for j in js] for r, (js, _) in enumerate(feats)])
+    mu, sd, w_lr = fit_logreg(Fv, yv.astype(float))
+    say(f"stacked fusion: logistic regression on {len(yv)} validation candidates "
+        f"({int(yv.sum())} positive), {Fv.shape[1]} features\n")
+
+    def stacked(scores, cols):
+        S = np.zeros_like(scores[scorers[0]])
+        for r, (js, F) in enumerate(stack_features(scores, cols)):
+            Z = np.hstack([(F - mu) / sd, np.ones((len(F), 1))])
+            S[r, js] = 1 / (1 + np.exp(-Z @ w_lr))
+        return S
+    test_truth = [set(recs[i]["categories"]) for i in test]
+    return SimpleNamespace(recs=recs, X=X, M=M, train=train, val=val, test=test, vocab=vocab,
+                           vocab_index=vocab_index, scorers=scorers, all_scores=all_scores, fuse=fuse,
+                           best_w=best_w, image_only_w=image_only_w, test_truth=test_truth,
+                           stacked=stacked)
+
+
+def main():
+    args = parse_args()
+    ctx = prepare(args)
+    recs, test, vocab, vocab_index, scorers = ctx.recs, ctx.test, ctx.vocab, ctx.vocab_index, ctx.scorers
+    fuse, best_w, test_truth = ctx.fuse, ctx.best_w, ctx.test_truth
+    with open(os.path.join(args.data, "fusion_weights.json"), "w") as f:  # read by demo.py
+        json.dump(dict(zip(scorers, map(float, best_w))), f)
+
+    test_scores, cols = ctx.all_scores(test)
     results = {name: test_scores[name] for name in scorers}
-    results["image only (fused)"] = fuse(test_scores, [*image_only] + [0] * (len(scorers) - 2))
+    results["image only (fused)"] = fuse(test_scores, ctx.image_only_w)
     results["all (fused)"] = fuse(test_scores, best_w)
+    results["all (stacked)"] = ctx.stacked(test_scores, cols)
 
     # Every image carries its seed, so also check the labels that are not the seed.
     def non_seed_recall(S):
@@ -260,8 +350,8 @@ def main():
         print(f"{name:<20}" + "".join(f"{m[x]:8.3f}" for x in names)
               + f"{macro_map(S, test_truth, cols, vocab_index):8.3f}{non_seed_recall(S):15.3f}")
 
-    S = results["all (fused)"]
-    print("\nall (fused), by seed type:")
+    S = results["all (stacked)"]
+    print("\nall (stacked), by seed type:")
     groups = defaultdict(list)
     for row, i in enumerate(test):
         groups[recs[i].get("seed_type") or "none"].append(row)
