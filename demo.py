@@ -9,7 +9,8 @@ behind it. Accepting adds the image to the in-memory index at once (no
 retraining); every accept/reject is appended to data/feedback.jsonl.
 
 Uses everything in --data built by embed.py and candidates.py, plus
-fusion_weights.json written by baseline.py.
+stack_model.json (the learned blend) written by baseline.py; falls back to the
+fixed weights in fusion_weights.json if the stacked model is missing.
 """
 import argparse
 import base64
@@ -30,12 +31,12 @@ import open_clip
 import torch
 from PIL import Image
 
-from baseline import temporal_split
+from baseline import is_process, temporal_split
 from candidates import query_words, search_categories
 from embed import MODEL, PRETRAINED, category_prompt, download, meta_text, thumb_path
 from fetch_commons import THUMB_WIDTH, api_get, strip_html
 
-K, TAU, TEMP, MIN_CAND_FILES, TOP = 20, 0.05, 0.01, 2, 10
+K, TAU, TEMP, MIN_CAND_FILES, TOP = 20, 0.1, 0.03, 2, 10  # as tuned by tune.py
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -53,9 +54,15 @@ class Suggester:
         for i, r in enumerate(self.recs):
             for c in r["categories"]:
                 self.Y[i, self.cat_index[c]] = True
+        self.counts = self.Y.sum(0)  # images per category in the index
+        self.process = np.array([is_process(c) for c in self.cats])  # workflow categories, never suggested
         names = json.load(open(os.path.join(data, "cand_categories.json"), encoding="utf-8"))
         self.name_emb = dict(zip(names, np.load(os.path.join(data, "cand_text_emb.npy"))))
         self.weights = json.load(open(os.path.join(data, "fusion_weights.json")))
+        stack_path = os.path.join(data, "stack_model.json")
+        self.stack = json.load(open(stack_path)) if os.path.exists(stack_path) else None
+        if self.stack:
+            self.stack.update({k: np.array(self.stack[k]) for k in ("mu", "sd", "w")})
         _, _, self.test, _ = temporal_split(self.recs, self.X, 0.1, 0.2, 0.95)
 
         self.device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
@@ -89,9 +96,10 @@ class Suggester:
         return w @ self.Y[nn].astype(np.float32), nn, sims[nn]
 
     @staticmethod
-    def softmax_scores(q, Tall):
-        logits = Tall @ q / TEMP
-        p = np.exp(logits - logits.max())
+    def softmax_scores(q, Tall, allowed):
+        logits = Tall[allowed] @ q / TEMP
+        p = np.zeros(len(Tall), np.float32)
+        p[allowed] = np.exp(logits - logits.max())
         return p / p.sum()
 
     def suggest(self, img, rec, exclude=None):
@@ -104,7 +112,8 @@ class Suggester:
         found = []
         if words:
             try:
-                found = [c for c, files in search_categories(words, 30) if files >= MIN_CAND_FILES]
+                found = [c for c, files in search_categories(words, 30)
+                         if files >= MIN_CAND_FILES and not is_process(c)]
             except Exception as e:  # search is optional; the other four scorers still work
                 print(f"search failed: {e}")
         extra = [c for c in found if c not in self.cat_index]
@@ -123,20 +132,29 @@ class Suggester:
             col = self.cat_index[c] if c in self.cat_index else len(self.cats) + extra.index(c)
             search[col] = 1 / (rank + 1)
         search /= max(search.sum(), 1e-9)
+        # As in baseline.py: a category is suggestible if some indexed image uses it or
+        # search found it for this image, and it is not a workflow category.
+        counts = np.concatenate([self.counts, pad])
+        allowed = ((counts > 0) | (search > 0)) & ~np.concatenate([self.process, pad.astype(bool)])
         parts = {
             "img_knn": np.concatenate([img_knn, pad]),
-            "img_txt": self.softmax_scores(x, Tall),
+            "img_txt": self.softmax_scores(x, Tall, allowed),
             "meta_knn": np.concatenate([meta_knn, pad]),
-            "meta_txt": self.softmax_scores(m, Tall),
+            "meta_txt": self.softmax_scores(m, Tall, allowed),
             "search": search,
         }
-        S = sum(self.weights[k] * v for k, v in parts.items())
+        if self.stack:
+            S, contribs = self.stacked(parts, allowed, counts)
+        else:
+            S = sum(self.weights[k] * v for k, v in parts.items())
+            contribs = {k: self.weights[k] * v for k, v in parts.items()}
+        S[~allowed] = -1
         top = np.argsort(-S)[:TOP]
 
         out = []
         for j in top:
             c = names[j]
-            contrib = {k: float(self.weights[k] * parts[k][j]) for k in parts}
+            contrib = {k: float(contribs[k][j]) for k in parts}
             backers = []
             if j < len(self.cats):
                 for nn, sims in ((img_nn, img_sims), (meta_nn, meta_sims)):
@@ -162,6 +180,36 @@ class Suggester:
             "ms": round((time.perf_counter() - t0) * 1000),
         }
 
+    def stacked(self, parts, allowed, counts):
+        """Learned blend from baseline.py: logistic regression over the union of each
+        scorer's top candidates, with the same 17 features. Also returns, per scorer,
+        how much it raised the log-odds compared with that scorer saying nothing."""
+        st, n = self.stack, len(parts["img_knn"])
+        valid = np.flatnonzero(allowed)  # ranks are among suggestible categories only
+        ranks, cand = {}, set()
+        for k in st["scorers"]:
+            order = valid[np.argsort(-parts[k][valid])]
+            ranks[k] = np.full(n, n)
+            ranks[k][order] = np.arange(len(order))
+            cand.update(order[: st["stack_top"]].tolist())
+        js = np.array(sorted(cand))
+        F, silent = [], []
+        for k in st["scorers"]:
+            sc = parts[k][js]
+            F += [sc, np.log(sc + 1e-4), 1 / (1 + ranks[k][js])]
+            silent += [0.0, np.log(1e-4), 0.0]
+        F = np.stack(F + [np.log1p(counts[js]), (counts[js] == 0).astype(float)], 1)  # 2nd: only search found it
+        w, bias = st["w"][:-1], st["w"][-1]
+        S = np.full(n, -1.0)
+        S[js] = 1 / (1 + np.exp(-(((F - st["mu"]) / st["sd"]) @ w + bias)))
+        m = len(silent)
+        lift = (F[:, :m] - silent) / st["sd"][:m] * w[:m]
+        contribs = {}
+        for i, k in enumerate(st["scorers"]):
+            contribs[k] = np.zeros(n)
+            contribs[k][js] = np.maximum(lift[:, 3 * i: 3 * i + 3].sum(1), 0)
+        return S, contribs
+
     # ---- feedback: accepted labels join the index at once ----------------
     def feedback(self, qid, category, decision):
         s = self.sessions.get(qid)
@@ -177,12 +225,16 @@ class Suggester:
             self.cats.append(category)
             self.T = np.vstack([self.T, self.name_emb[category][None]])
             self.Y = np.hstack([self.Y, np.zeros((len(self.Y), 1), bool)])
+            self.counts = np.append(self.counts, 0)
+            self.process = np.append(self.process, False)
         if s["row"] is None:  # a new image: append it to the index
             self.X = np.vstack([self.X, s["x"][None]])
             self.M = np.vstack([self.M, s["m"][None]])
             self.Y = np.vstack([self.Y, np.zeros((1, self.Y.shape[1]), bool)])
             self.recs.append({**s["rec"], "categories": []})
             s["row"] = len(self.recs) - 1
+        if not self.Y[s["row"], self.cat_index[category]]:
+            self.counts[self.cat_index[category]] += 1
         self.Y[s["row"], self.cat_index[category]] = True
         self.recs[s["row"]]["categories"] = sorted(set(self.recs[s["row"]]["categories"]) | {category})
         return {"ok": True, "note": f"added to the index ({len(self.recs)} images); no retraining"}

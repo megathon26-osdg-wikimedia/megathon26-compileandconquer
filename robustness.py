@@ -1,9 +1,9 @@
 """How much accuracy is lost on low-quality images?
 
 Degrades each cached test thumbnail (blur, heavy JPEG, low resolution), re-embeds
-it with CLIP and scores it against the clean training index, with the fusion
-weights picked on clean validation data. Titles and descriptions are untouched,
-since a bad photo still has its text.
+it with CLIP and scores it against the clean training index, with the fixed
+weights and the stacked fusion both fit on clean validation data. Titles and
+descriptions are untouched, since a bad photo still has its text.
 
 Usage:
     python3 robustness.py --data data
@@ -68,18 +68,18 @@ def main():
         scores, cols = ctx.all_scores(test, Xq)
         img = precision_recall_at_k(ctx.fuse(scores, ctx.image_only_w), ctx.test_truth, cols)
         full = precision_recall_at_k(ctx.fuse(scores, ctx.best_w), ctx.test_truth, cols)
-        rows.append((name, img, full))
+        stack = precision_recall_at_k(ctx.stacked(scores, cols), ctx.test_truth, cols)
+        rows.append((name, img, full, stack))
         print(f"  done: {name}")
 
-    base_img, base_full = rows[0][1], rows[0][2]
-    print(f"\n{len(test)} test images; fusion weights from clean validation data\n")
-    print(f"{'condition':<18}{'image only':>22}{'all five scorers':>26}")
-    print(f"{'':<18}{'P@1':>11}{'R@10':>11}{'P@1':>13}{'R@10':>13}")
-    for name, img, full in rows:
-        print(f"{name:<18}{img['P@1']:>11.3f}{img['R@10']:>11.3f}{full['P@1']:>13.3f}{full['R@10']:>13.3f}"
-              + ("" if name == "clean" else
-                 f"   (P@1 change: image only {img['P@1'] - base_img['P@1']:+.3f},"
-                 f" all five {full['P@1'] - base_full['P@1']:+.3f})"))
+    base = rows[0][1:]
+    print(f"\n{len(test)} test images; fusion fit on clean validation data\n")
+    heads = ["image only", "all five, fixed", "all five, stacked"]
+    print(f"{'condition':<18}" + "".join(f"{h:>20}" for h in heads) + "   P@1 change (stacked)")
+    print(f"{'':<18}" + f"{'P@1':>10}{'R@10':>10}" * 3)
+    for name, *ms in rows:
+        print(f"{name:<18}" + "".join(f"{m['P@1']:>10.3f}{m['R@10']:>10.3f}" for m in ms)
+              + ("" if name == "clean" else f"   {ms[2]['P@1'] - base[2]['P@1']:+.3f}"))
 
 
 if __name__ == "__main__":

@@ -83,8 +83,8 @@ def main():
     score_t = []
     for i in idx:
         t0 = time.perf_counter()
-        s, _ = ctx.all_scores([i])
-        S = ctx.fuse(s, ctx.best_w)
+        s, cols = ctx.all_scores([i])
+        S = ctx.stacked(s, cols)
         np.argpartition(-S[0], 10)[:10]
         score_t.append(time.perf_counter() - t0)
 
@@ -100,7 +100,7 @@ def main():
     for d, (img_t, txt_t, _, _) in enc.items():
         print(f"  CLIP image encode ({d:<4})        {ms(img_t)}")
         print(f"  CLIP text encode  ({d:<4})        {ms(txt_t)}")
-    print(f"  scoring + fusion (numpy, CPU)    {ms(score_t)}")
+    print(f"  scoring + stacked fusion (CPU)   {ms(score_t)}")
     print(f"  Commons search API (network)     {ms(search_t)}   ({len(search_t)} live calls)")
     fast = devices[-1]
     total = (np.median(enc[fast][0]) + np.median(enc[fast][1]) + np.median(score_t) + np.median(search_t)) * 1000

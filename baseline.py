@@ -20,12 +20,31 @@ import argparse
 import itertools
 import json
 import os
+import re
 from collections import defaultdict
 from types import SimpleNamespace
 
 import numpy as np
 
 KS = (1, 5, 10)
+
+# Workflow and attribution categories (contests, upload campaigns, holding "dumps",
+# photographer credits, licences) describe how a file arrived, not what it shows.
+# Commons does not always mark them hidden; the problem statement asks to drop them.
+PROCESS = re.compile(r"""(
+    \(review\ needed\) | \(dump\) | \bneeding\ (categories|check|review|identification)\b |
+    \bneeds?\ (categories|categorization|check|review)\b |
+    ^Category:(Images|Files|Photos|Media|Pictures|Photographs)\ (from|by|uploaded|taken\ by|contributed|with|of\ user) |
+    ^Category:Uploaded\ | \buploaded\ (by|with|from|via)\b | ^Category:Self-published |
+    ^Category:Wiki\ Loves | ^Category:(CC|GFDL|PD|Public\ domain|Licen[cs]e)[-\ ] | ^Category:Taken\ with |
+    ^Category:Flickr\b | ^Category:(Quality|Featured|Valued)\ (images|pictures) | ^Category:Files\ with |
+    ^Category:Photographs\ by | ^Category:Photos\ by | ^Category:Work\ by | ^Category:Created\ with |
+    ^Category:Scans\ (by|from) | ^Category:Supported\ by | \bby\ (user|uploader)\b
+)""", re.I | re.X)
+
+
+def is_process(cat):
+    return bool(PROCESS.search(cat))
 
 
 def load(data_dir):
@@ -121,18 +140,19 @@ def text_scores(Q, Tvocab, Textra, pad, temp):
 
 
 def precision_recall_at_k(S, true_sets, cols):
-    """Sample-averaged P@k and R@k. true_sets keeps labels the model cannot suggest,
-    so they still count against recall."""
+    """Sample-averaged P@k, R@k and F1@k (F1 per image, then averaged). true_sets keeps
+    labels the model cannot suggest, so they still count against recall."""
     top = np.argpartition(-S, max(KS), axis=1)[:, : max(KS)]
     top = np.take_along_axis(top, np.argsort(-np.take_along_axis(S, top, 1), axis=1), 1)
     out = {}
     for k in KS:
-        p, r = [], []
+        p, r, f = [], [], []
         for row, (js, truth) in enumerate(zip(top[:, :k], true_sets)):
             hits = sum(cols.name(row, j) in truth for j in js)
             p.append(hits / k)
             r.append(hits / len(truth))
-        out[f"P@{k}"], out[f"R@{k}"] = np.mean(p), np.mean(r)
+            f.append(2 * p[-1] * r[-1] / (p[-1] + r[-1]) if hits else 0.0)
+        out[f"P@{k}"], out[f"R@{k}"], out[f"F1@{k}"] = np.mean(p), np.mean(r), np.mean(f)
     return out
 
 
@@ -188,8 +208,8 @@ def parse_args(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", default="data")
     ap.add_argument("--k", type=int, default=20, help="neighbours for k-NN voting")
-    ap.add_argument("--tau", type=float, default=0.05, help="k-NN similarity temperature")
-    ap.add_argument("--temp", type=float, default=0.01, help="zero-shot softmax temperature (CLIP uses 0.01)")
+    ap.add_argument("--tau", type=float, default=0.1, help="k-NN similarity temperature (tuned with tune.py)")
+    ap.add_argument("--temp", type=float, default=0.03, help="zero-shot softmax temperature (tuned with tune.py)")
     ap.add_argument("--dup-thresh", type=float, default=0.95, help="cosine above this = near-duplicate")
     ap.add_argument("--no-candidates", action="store_true", help="ignore candidates.py output")
     ap.add_argument("--min-cand-files", type=int, default=2,
@@ -198,16 +218,24 @@ def parse_args(argv=None):
                     help="candidates per scorer that the stacked fusion re-ranks")
     ap.add_argument("--objective", default="P@1+R@10", choices=["R@5", "P@1", "R@10", "P@1+R@10"],
                     help="what the fusion weights maximize on validation")
+    ap.add_argument("--keep-process", action="store_true",
+                    help="keep workflow/attribution categories (contests, dumps, credits) as labels")
+    ap.add_argument("--context", action="store_true",
+                    help="add familiarity x score and search-count x score features to the stacked fusion "
+                         "(tested: no gain, so off by default)")
+    ap.add_argument("--skip-grid", action="store_true", help="skip the fixed-weight grid search (faster)")
     ap.add_argument("--examples", type=int, default=4, help="test images to print suggestions for")
     return ap.parse_args(argv)
 
 
-def prepare(args, verbose=True):
+def prepare(args, verbose=True, holdout=False):
     """Load data, split, build the vocabulary and pick fusion weights on validation.
 
     Returns a namespace with everything needed to score any set of images,
     including all_scores(idx, Xq=None): Xq replaces the query images' embeddings
     (e.g. degraded copies), while the training index stays clean.
+    holdout=True fits the stacked fusion on half of validation and returns the other
+    half as ctx.holdout, for tuning settings without touching test.
     """
     say = print if verbose else (lambda *a, **k: None)
     recs, X, M, cats, T = load(args.data)
@@ -217,6 +245,15 @@ def prepare(args, verbose=True):
     say(f"test uploads from {recs[test[0]]['timestamp'][:10]} onward")
 
     cands, cand_emb = (None, {}) if args.no_candidates else load_candidates(args.data, args.min_cand_files)
+    if not args.keep_process:
+        n_before = sum(len(r["categories"]) for r in recs)
+        recs = [{**r, "categories": [c for c in r["categories"] if not is_process(c)]} for r in recs]
+        if cands:
+            cands = {t: [c for c in cs if not is_process(c)] for t, cs in cands.items()}
+        has = np.array([bool(r["categories"]) for r in recs])
+        train, val, test = train[has[train]], val[has[val]], test[has[test]]
+        say(f"dropped {n_before - sum(len(r['categories']) for r in recs)} workflow/attribution labels; "
+            f"{int((~has).sum())} images had no content category left (now: val {len(val)}, test {len(test)})")
     scorers = ["img_knn", "img_txt", "meta_knn", "meta_txt"] + (["search"] if cands else [])
 
     vocab = sorted({c for i in train for c in recs[i]["categories"]})
@@ -251,6 +288,10 @@ def prepare(args, verbose=True):
                 for rank, c in enumerate(f):
                     srch[r, cols.col(r, c, vocab_index)] = 1 / (rank + 1)
             s["search"] = srch / np.maximum(srch.sum(1, keepdims=True), 1e-9)
+        # Per-image context for the stacked fusion: how familiar the image and its
+        # text are (closest training neighbour) and how much search found.
+        s["_context"] = np.stack([(Xq @ Xtrain.T).max(1), (M[idx] @ Mtrain.T).max(1),
+                                  np.log1p([len(f) for f in found])], 1)
         return s, cols
 
     def objective(m):
@@ -260,22 +301,31 @@ def prepare(args, verbose=True):
         return sum(wi * scores[name] for wi, name in zip(w, scorers))
 
     # Pick fusion weights on validation (grid over the simplex, step 0.1), never on test.
+    hold = None
+    if holdout:
+        perm = np.random.default_rng(0).permutation(len(val))
+        val, hold = val[np.sort(perm[: len(val) // 2])], val[np.sort(perm[len(val) // 2:])]
     val_scores, val_cols = all_scores(val)
     val_truth = [set(recs[i]["categories"]) for i in val]
-    best_w = max(simplex(len(scorers), 10),
-                 key=lambda w: objective(precision_recall_at_k(fuse(val_scores, w), val_truth, val_cols)))
-    say(f"fusion weights picked on validation (maximizing {args.objective}): "
-          + ", ".join(f"{n}={w:.1f}" for n, w in zip(scorers, best_w)) + "\n")
-
-    image_only = max(simplex(2, 10), key=lambda w: objective(precision_recall_at_k(
-        fuse(val_scores, [*w] + [0] * (len(scorers) - 2)), val_truth, val_cols)))
-    image_only_w = [*image_only] + [0] * (len(scorers) - 2)
+    if args.skip_grid:
+        best_w = np.full(len(scorers), 1 / len(scorers))
+        image_only_w = [0.5, 0.5] + [0] * (len(scorers) - 2)
+    else:
+        best_w = max(simplex(len(scorers), 10),
+                     key=lambda w: objective(precision_recall_at_k(fuse(val_scores, w), val_truth, val_cols)))
+        say(f"fusion weights picked on validation (maximizing {args.objective}): "
+              + ", ".join(f"{n}={w:.1f}" for n, w in zip(scorers, best_w)) + "\n")
+        image_only = max(simplex(2, 10), key=lambda w: objective(precision_recall_at_k(
+            fuse(val_scores, [*w] + [0] * (len(scorers) - 2)), val_truth, val_cols)))
+        image_only_w = [*image_only] + [0] * (len(scorers) - 2)
 
     # Calibrated stacking: instead of one global weight per scorer, a logistic
     # regression on validation data predicts "editors used this category" from each
     # candidate's scores, log-scores and ranks under every scorer, plus how common the
     # category is in training and whether only search found it. It re-ranks the union
-    # of each scorer's top candidates for an image.
+    # of each scorer's top candidates for an image. Optional context features
+    # (--context) multiply each scorer's score by the image's familiarity and search
+    # count; in our tests they did not help, so they are off by default.
     freq = Ytrain.sum(0)
 
     def stack_features(scores, cols):
@@ -296,6 +346,9 @@ def prepare(args, verbose=True):
                 sc = scores[k][r, js]
                 F += [sc, np.log(sc + 1e-4), 1 / (1 + ranks[k][r, js])]
             F += [np.log1p(np.array([freq[j] if j < cols.V else 0 for j in js])), (js >= cols.V).astype(float)]
+            if args.context:
+                for c in scores["_context"][r]:
+                    F += [scores[k][r, js] * c for k in scorers]
             out.append((js, np.stack(F, 1)))
         return out
 
@@ -316,7 +369,9 @@ def prepare(args, verbose=True):
     return SimpleNamespace(recs=recs, X=X, M=M, train=train, val=val, test=test, vocab=vocab,
                            vocab_index=vocab_index, scorers=scorers, all_scores=all_scores, fuse=fuse,
                            best_w=best_w, image_only_w=image_only_w, test_truth=test_truth,
-                           stacked=stacked)
+                           stacked=stacked, holdout=hold,
+                           stack_model={"scorers": scorers, "stack_top": args.stack_top, "context": args.context,
+                                        "mu": mu.tolist(), "sd": sd.tolist(), "w": w_lr.tolist()})
 
 
 def main():
@@ -326,6 +381,9 @@ def main():
     fuse, best_w, test_truth = ctx.fuse, ctx.best_w, ctx.test_truth
     with open(os.path.join(args.data, "fusion_weights.json"), "w") as f:  # read by demo.py
         json.dump(dict(zip(scorers, map(float, best_w))), f)
+    if not args.context:  # the demo builds only the default stacking features
+        with open(os.path.join(args.data, "stack_model.json"), "w") as f:  # read by demo.py
+            json.dump(ctx.stack_model, f)
 
     test_scores, cols = ctx.all_scores(test)
     results = {name: test_scores[name] for name in scorers}
@@ -343,7 +401,7 @@ def main():
                 rs.append(len({cols.name(r, j) for j in js} & truth) / len(truth))
         return np.mean(rs)
 
-    names = ["P@1", "P@5", "R@5", "R@10"]
+    names = ["P@1", "P@5", "R@5", "R@10", "F1@1"]
     print(f"{'method':<20}" + "".join(f"{c:>8}" for c in names + ["mAP"]) + f"{'R@10 non-seed':>15}")
     for name, S in results.items():
         m = precision_recall_at_k(S, test_truth, cols)
@@ -360,8 +418,14 @@ def main():
         sub.P = cols.P
         before = precision_recall_at_k(results["image only (fused)"][rows], [test_truth[r] for r in rows], sub)
         m = precision_recall_at_k(S[rows], [test_truth[r] for r in rows], sub)
-        print(f"  {kind:<10} n={len(rows):<5} P@1 {m['P@1']:.3f}  R@10 {m['R@10']:.3f}"
+        print(f"  {kind:<10} n={len(rows):<5} P@1 {m['P@1']:.3f}  R@10 {m['R@10']:.3f}  F1@1 {m['F1@1']:.3f}"
               f"   (image only: P@1 {before['P@1']:.3f}  R@10 {before['R@10']:.3f})")
+    seed_rows = [r for kind, rows in groups.items() if kind != "random" for r in rows]
+    if "random" in groups and seed_rows:
+        sub = Columns(vocab, [cols.extra[r] for r in seed_rows])
+        sub.P = cols.P
+        m = precision_recall_at_k(S[seed_rows], [test_truth[r] for r in seed_rows], sub)
+        print(f"  {'all seed':<10} n={len(seed_rows):<5} P@1 {m['P@1']:.3f}  R@10 {m['R@10']:.3f}  F1@1 {m['F1@1']:.3f}")
 
     for e in range(args.examples):
         r = e * len(test) // max(args.examples, 1)
