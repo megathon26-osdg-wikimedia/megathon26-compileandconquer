@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Category Suggester</title>
+<style>
+  :root {
+    --bg: #f6f6f4; --card: #ffffff; --ink: #1d1d1b; --quiet: #6b6b66; --line: #e3e2dd;
+    --accent: #2f6fdf; --accent-soft: #e6eefc; --good: #1f8a4c; --good-soft: #e3f4ea;
+    --bad: #c2412d; --img: #2f6fdf; --txt: #b7791f; --srch: #7c4dbd;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #161615; --card: #20201f; --ink: #ecebe6; --quiet: #a09f98; --line: #34332f;
+      --accent: #6b9cf0; --accent-soft: #23314a; --good: #5cc28a; --good-soft: #1d3327;
+      --bad: #e07a66; --img: #6b9cf0; --txt: #d9a54a; --srch: #a985e0;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+         font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 1080px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .sub { color: var(--quiet); margin: 0 0 20px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px; }
+  .tabs { display: flex; gap: 6px; margin-bottom: 12px; flex-wrap: wrap; }
+  .tab { border: 1px solid var(--line); background: none; color: var(--ink); padding: 6px 12px;
+         border-radius: 999px; cursor: pointer; font: inherit; }
+  .tab.on { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+  .pane { display: none; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .pane.on { display: flex; }
+  input[type=text], textarea { flex: 1 1 260px; min-width: 0; padding: 8px 10px; border: 1px solid var(--line);
+         border-radius: 8px; background: var(--bg); color: var(--ink); font: inherit; }
+  textarea { flex-basis: 100%; height: 56px; resize: vertical; }
+  button.go { background: var(--accent); color: #fff; border: 0; padding: 8px 16px; border-radius: 8px;
+              font: inherit; font-weight: 600; cursor: pointer; }
+  button.go:disabled { opacity: .5; cursor: wait; }
+  .hint { color: var(--quiet); font-size: 13px; flex-basis: 100%; }
+  #status { margin: 14px 2px; color: var(--quiet); min-height: 1.4em; }
+  #status.err { color: var(--bad); }
+  .result { display: grid; grid-template-columns: 300px 1fr; gap: 16px; align-items: start; }
+  @media (max-width: 760px) { .result { grid-template-columns: 1fr; } }
+  .query img { width: 100%; border-radius: 8px; display: block; background: var(--line); }
+  .query h2 { font-size: 15px; margin: 10px 0 4px; word-break: break-word; }
+  .query .desc { color: var(--quiet); font-size: 13px; max-height: 7.5em; overflow: auto; margin: 0 0 10px; }
+  .label { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--quiet); margin: 10px 0 6px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 5px; }
+  .chip { font-size: 12.5px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); }
+  .chip.hit { background: var(--good-soft); border-color: var(--good); color: var(--good); }
+  .legend { display: flex; gap: 14px; font-size: 12.5px; color: var(--quiet); margin: 0 0 10px; flex-wrap: wrap; }
+  .sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+  ol { list-style: none; margin: 0; padding: 0; }
+  li.sug { border-top: 1px solid var(--line); padding: 12px 0; display: grid;
+           grid-template-columns: 26px 1fr auto; gap: 4px 10px; }
+  li.sug:first-child { border-top: 0; padding-top: 0; }
+  .rank { color: var(--quiet); font-variant-numeric: tabular-nums; padding-top: 1px; }
+  .name a { color: var(--ink); font-weight: 600; text-decoration: none; }
+  .name a:hover { text-decoration: underline; }
+  .tag { font-size: 11.5px; margin-left: 6px; padding: 1px 6px; border-radius: 4px; }
+  .tag.truth { background: var(--good-soft); color: var(--good); }
+  .tag.new { background: var(--accent-soft); color: var(--accent); }
+  .bar { grid-column: 2; display: flex; height: 6px; border-radius: 3px; overflow: hidden;
+         background: var(--line); margin: 4px 0 2px; }
+  .bar span { display: block; height: 100%; }
+  .why { grid-column: 2; font-size: 12.5px; color: var(--quiet); }
+  .sims { grid-column: 2; display: flex; gap: 6px; margin-top: 6px; }
+  .sims img { width: 56px; height: 56px; object-fit: cover; border-radius: 5px; display: block; }
+  .acts { grid-row: 1 / span 4; grid-column: 3; display: flex; gap: 6px; align-items: start; }
+  .acts button { border: 1px solid var(--line); background: none; color: var(--ink); border-radius: 6px;
+                 padding: 4px 10px; cursor: pointer; font: inherit; font-size: 13px; }
+  .acts button.yes:hover { border-color: var(--good); color: var(--good); }
+  .acts button.no:hover { border-color: var(--bad); color: var(--bad); }
+  .done { font-size: 12.5px; color: var(--quiet); max-width: 170px; }
+  .done.yes { color: var(--good); }
+  .done.no { color: var(--bad); }
+  .meta { color: var(--quiet); font-size: 12.5px; margin-top: 12px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Commons category suggester</h1>
+  <p class="sub">Suggests categories for an image from five signals; an editor accepts or rejects each one.</p>
+
+  <div class="card">
+    <div class="tabs">
+      <button class="tab on" data-pane="p-random">Random test image</button>
+      <button class="tab" data-pane="p-commons">Commons file</button>
+      <button class="tab" data-pane="p-upload">Upload a photo</button>
+    </div>
+    <div class="pane on" id="p-random">
+      <button class="go" id="b-random">Suggest for a random test image</button>
+      <span class="hint">Picks one of the 1,191 newest uploads held out for testing.</span>
+    </div>
+    <div class="pane" id="p-commons">
+      <input type="text" id="i-title" placeholder="File:Example.jpg or a commons.wikimedia.org link">
+      <button class="go" id="b-commons">Suggest</button>
+      <span class="hint">Any image on Commons; its real categories are shown for comparison.</span>
+    </div>
+    <div class="pane" id="p-upload">
+      <input type="file" id="i-file" accept="image/*">
+      <input type="text" id="i-utitle" placeholder="Title, e.g. Sunset over Marina Beach, Chennai">
+      <textarea id="i-udesc" placeholder="Description (optional)"></textarea>
+      <button class="go" id="b-upload">Suggest</button>
+    </div>
+  </div>
+
+  <div id="status"></div>
+  <div id="out"></div>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+const short = c => c.replace(/^Category:/, "");
+let current = null;
+
+document.querySelectorAll(".tab").forEach(t => t.onclick = () => {
+  document.querySelectorAll(".tab").forEach(x => x.classList.toggle("on", x === t));
+  document.querySelectorAll(".pane").forEach(p => p.classList.toggle("on", p.id === t.dataset.pane));
+});
+
+function status(msg, err) { const s = $("#status"); s.textContent = msg; s.className = err ? "err" : ""; }
+
+async function run(url, body) {
+  document.querySelectorAll("button.go").forEach(b => b.disabled = true);
+  status("Thinking... (the Commons search takes about a second)");
+  try {
+    const r = await fetch(url, body ? {method: "POST", headers: {"Content-Type": "application/json"},
+                                       body: JSON.stringify(body)} : {});
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error || r.statusText);
+    current = data; render(data); status("");
+  } catch (e) { status(e.message, true); }
+  document.querySelectorAll("button.go").forEach(b => b.disabled = false);
+}
+
+$("#b-random").onclick = () => run("/api/random");
+$("#b-commons").onclick = () => run("/api/commons", {title: $("#i-title").value});
+$("#i-title").onkeydown = e => { if (e.key === "Enter") $("#b-commons").click(); };
+$("#b-upload").onclick = () => {
+  const f = $("#i-file").files[0];
+  if (!f) return status("Choose an image first.", true);
+  const rd = new FileReader();
+  rd.onload = () => run("/api/upload", {image: rd.result, title: $("#i-utitle").value, description: $("#i-udesc").value});
+  rd.readAsDataURL(f);
+};
+
+function render(d) {
+  const q = d.query, truth = new Set(q.truth);
+  const suggested = new Set(d.suggestions.map(s => s.category));
+  const hits = d.suggestions.filter(s => truth.has(s.category)).length;
+  const rows = d.suggestions.map((s, i) => {
+    const c = s.contrib, img = c.img_knn + c.img_txt, txt = c.meta_knn + c.meta_txt, srch = c.search;
+    const tot = img + txt + srch || 1, pct = v => Math.round(100 * v / tot);
+    const why = [img && `image ${pct(img)}%`, txt && `title ${pct(txt)}%`, srch && `search ${pct(srch)}%`]
+      .filter(Boolean).join(" · ");
+    const sims = s.similar.map(m => `<img src="${m.thumb}" title="${esc(m.title)} (similarity ${m.sim})" alt="">`).join("");
+    return `<li class="sug" data-cat="${esc(s.category)}">
+      <div class="rank">${i + 1}</div>
+      <div class="name"><a href="https://commons.wikimedia.org/wiki/${encodeURI(s.category)}" target="_blank" rel="noopener">${esc(short(s.category))}</a>${
+        truth.has(s.category) ? '<span class="tag truth">editors used this</span>' : ""}${
+        s.in_index ? "" : '<span class="tag new">found by search</span>'}</div>
+      <div class="acts"><button class="yes">Accept</button><button class="no">Reject</button></div>
+      <div class="bar" title="share of the score from each signal">
+        <span style="width:${pct(img)}%;background:var(--img)"></span>
+        <span style="width:${pct(txt)}%;background:var(--txt)"></span>
+        <span style="width:${pct(srch)}%;background:var(--srch)"></span></div>
+      <div class="why">score ${s.score.toFixed(2)} · ${why}${s.similar.length ? " · similar images:" : ""}</div>
+      ${sims ? `<div class="sims">${sims}</div>` : ""}
+    </li>`;
+  }).join("");
+  const truthChips = q.truth.length
+    ? q.truth.map(c => `<span class="chip ${suggested.has(c) ? "hit" : ""}">${esc(short(c))}</span>`).join("")
+    : '<span class="chip">none (new upload)</span>';
+  $("#out").innerHTML = `<div class="result">
+    <div class="card query">
+      <img src="${q.thumb}" alt="">
+      <h2>${esc(q.title.replace(/^File:/, ""))}</h2>
+      <p class="desc">${esc(q.description) || "<i>no description</i>"}</p>
+      <div class="label">Categories editors gave it${q.truth.length ? ` · ${hits} of ${q.truth.length} in our top 10` : ""}</div>
+      <div class="chips">${truthChips}</div>
+    </div>
+    <div class="card">
+      <div class="legend"><span><i class="sw" style="background:var(--img)"></i>image</span>
+        <span><i class="sw" style="background:var(--txt)"></i>title + description</span>
+        <span><i class="sw" style="background:var(--srch)"></i>Commons search</span></div>
+      <ol>${rows}</ol>
+      <div class="meta">${d.ms} ms · searched Commons for: ${esc(d.search_words.join(", ")) || "(no usable title words)"}</div>
+    </div></div>`;
+  document.querySelectorAll("li.sug").forEach(li => {
+    li.querySelector(".yes").onclick = () => decide(li, "accept");
+    li.querySelector(".no").onclick = () => decide(li, "reject");
+  });
+}
+
+async function decide(li, decision) {
+  const r = await fetch("/api/feedback", {method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({id: current.id, category: li.dataset.cat, decision})});
+  const d = await r.json();
+  li.querySelector(".acts").innerHTML = `<span class="done ${decision === "accept" ? "yes" : "no"}">${
+    decision === "accept" ? "Accepted" : "Rejected"}: ${esc(d.note || d.error)}</span>`;
+}
+</script>
+</body>
+</html>
