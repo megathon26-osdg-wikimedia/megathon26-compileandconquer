@@ -58,7 +58,8 @@ python3 demo.py
 - **Dataset:** fetched at run time from [Wikimedia Commons](https://commons.wikimedia.org)
   through the [MediaWiki Action API](https://commons.wikimedia.org/w/api.php).
   No dataset is stored in this repository. Images and metadata keep their
-  original Commons licences.
+  original Commons licences. Data is hosted online at [this link](https://drive.google.com/drive/folders/1VO0kpjDlV1h7y4W5XMESiH8KBC_G_kWT?usp=sharing). 
+
 - **Model weights:** OpenCLIP ViT-B/32 trained on LAION-2B
   ([laion/CLIP-ViT-B-32-laion2B-s34B-b79K](https://huggingface.co/laion/CLIP-ViT-B-32-laion2B-s34B-b79K)),
   downloaded automatically by [open_clip](https://github.com/mlfoundations/open_clip)
